@@ -51,7 +51,7 @@ class SchedulePolicy:
 
         # Compute matched prefix length
         prefix_computed = False
-        if policy == "lpm" or policy == "dfs-weight":
+        if policy == "lpm" or policy == "dfs-weight" or policy == "knapsack":
             for r in waiting_queue:
                 # NOTE: the prefix_indices must always be aligned with last_node
                 r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
@@ -88,6 +88,8 @@ class SchedulePolicy:
                 last_node_to_reqs,
                 waiting_queue,
             )
+        elif policy == "knapsack":
+            pass
         else:
             raise ValueError(f"Unknown schedule_policy: {policy=}")
 

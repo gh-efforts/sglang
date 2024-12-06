@@ -835,6 +835,21 @@ class Scheduler:
                 else set([])
             )
 
+        if self.policy == "knapsack":
+            import sglang_plugin
+            input = []
+
+            for req in self.waiting_queue:
+                input_tokens = req.extend_input_len
+                max_new_tokens =  min(req.sampling_params.max_new_tokens, 4096),
+                input.append(input_tokens + max_new_tokens)
+
+            index_list = sglang_plugin.knapsack(input,  self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size() - running_bs if self.is_mixed_chunk else 0)
+
+            for i in index_list:
+                req = self.waiting_queue.pop(i)
+                self.waiting_queue.insert(0, req)
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if (
