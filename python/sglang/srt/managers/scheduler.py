@@ -835,7 +835,7 @@ class Scheduler:
                 else set([])
             )
 
-        if self.policy == "knapsack":
+        if self.policy.policy == "knapsack":
             start_time = time.time()
 
             import sglang_plugin
