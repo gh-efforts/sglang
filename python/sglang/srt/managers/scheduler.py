@@ -836,6 +836,8 @@ class Scheduler:
             )
 
         if self.policy == "knapsack":
+            start_time = time.time()
+
             import sglang_plugin
             input = []
 
@@ -850,6 +852,10 @@ class Scheduler:
                 req = self.waiting_queue.pop(i)
                 self.waiting_queue.insert(0, req)
 
+            end_time = time.time()
+            execution_time_seconds = end_time - start_time
+            execution_time_milliseconds = execution_time_seconds * 1000
+            print(f"knapsack usage: {execution_time_milliseconds:.4f} ms")
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if (
