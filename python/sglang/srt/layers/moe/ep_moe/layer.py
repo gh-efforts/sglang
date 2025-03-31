@@ -46,6 +46,7 @@ if _is_cuda:
     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 else:
     from vllm import _custom_ops as vllm_ops
+import eplb
 
 
 logger = logging.getLogger(__name__)
