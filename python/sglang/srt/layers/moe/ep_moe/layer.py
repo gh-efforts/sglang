@@ -47,7 +47,6 @@ if _is_cuda:
 else:
     from vllm import _custom_ops as vllm_ops
 import eplb
-from sglang.srt.server_args import PortArgs, ServerArgs
 
 
 logger = logging.getLogger(__name__)
@@ -130,7 +129,6 @@ class EPMoE(torch.nn.Module):
 
     def __init__(
         self,
-        server_args: ServerArgs,
         num_experts: int,
         top_k: int,
         hidden_size: int,
@@ -156,9 +154,6 @@ class EPMoE(torch.nn.Module):
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
         self.tp_rank = get_tensor_model_parallel_rank()
-
-        self.num_nodes = server_args.nnodes
-        self.num_gpus = self.tp_size
 
         self.num_experts = num_experts
         assert self.num_experts % self.tp_size == 0
@@ -209,8 +204,6 @@ class EPMoE(torch.nn.Module):
 
         self.grouped_gemm_runner = None
 
-        self.iteration_count = 0
-
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
@@ -220,16 +213,9 @@ class EPMoE(torch.nn.Module):
                 use_flashinfer=False,  # TODO: use flashinfer
             )
 
-        # get batch_size, num_layers, hidden_dim size
-        batch_size, num_layers, hidden_dim = hidden_states.shape
-        # assert num_layers == self.num_layers, "The number of input layers does not match the number of model layers"
-
-        # Collect token distribution statistics
-        # First select the highest scoring groups, and within each group,
-        # select the topk with the highest score
         topk_weights, topk_ids = select_experts(
-            hidden_states=hidden_states.view(-1, hidden_dim),
-            router_logits=router_logits.view(-1, router_logits.shape[-1]),
+            hidden_states=hidden_states,
+            router_logits=router_logits,
             top_k=self.top_k,
             use_grouped_topk=self.use_grouped_topk,
             renormalize=self.renormalize,
@@ -239,51 +225,6 @@ class EPMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
         )
 
-        # todo：在做eplb的时候确定是用部分专家还是全部专家，从而来确定select_experts中传入的top_k和topk_group的数值是否修改
-
-        print("topk_weights.shape:", topk_weights.shape)
-        print("topk_ids.shape:", topk_ids.shape)
-        # todo: if topk_ids and topk_weights shape: [batch_size*num_layers, top_k]
-        num_total = topk_ids.shape[0]  # batch_size * num_layers
-        print("num_total:", num_total)
-
-        # reshape [num_layers, batch_size, top_k]
-        topk_ids = topk_ids.view(num_layers, batch_size, self.top_k)
-        topk_weights = topk_weights.view(num_layers, batch_size, self.top_k)
-
-        # Initialize expert_load and count the cumulative weight of each expert at each level
-        expert_load = torch.zeros(num_layers, self.num_experts, device=hidden_states.device, dtype=torch.float32)
-
-        # Calculated separately for each layer
-        for layer in range(num_layers):
-            # Flatten the data of the current layer to [batch_size * top_k]
-            layer_ids = topk_ids[layer].reshape(-1)  # Expert Index
-            layer_weights = topk_weights[layer].reshape(-1)  # corresponding weight
-            # Accumulate the weight of each expert
-            expert_load[layer].index_add_(0, layer_ids, layer_weights)
-
-        self.iteration_count += 1  # update counter
-        # todo:EPLB calls every 1000 tokens generated
-        if self.iteration_count % 1000 == 0:
-            # load balance
-            phy2log, log2phy, expert_count = eplb.rebalance_experts(
-                weight=expert_load,  # `expert_load` shape’s [num_layers, num_experts]
-                num_replicas=self.num_experts_per_partition * self.tp_size,
-                num_groups=self.num_groups,
-                num_nodes=self.num_nodes,
-                num_gpus=self.num_gpus,
-            )
-
-            # Update topk_ids physics expert after mapping to load balancing
-            for i in range(self.top_k):
-                layer_indices = torch.arange(batch_size * num_layers, device=hidden_states.device) // batch_size
-                topk_ids[:, i] = log2phy[layer_indices, topk_ids[:, i]]
-            print("expert_load.shape:", expert_load.shape)
-            print("phy2log.shape:", phy2log.shape)
-
-        # todo: waiting debugging
-
-        # Process the original expert selection results
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids, self.num_experts
         )
