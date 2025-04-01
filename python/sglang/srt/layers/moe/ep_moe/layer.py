@@ -47,6 +47,7 @@ if _is_cuda:
 else:
     from vllm import _custom_ops as vllm_ops
 import eplb
+from sglang.srt.server_args import PortArgs, ServerArgs
 
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,7 @@ class EPMoE(torch.nn.Module):
 
     def __init__(
         self,
+        server_args: ServerArgs,
         num_experts: int,
         top_k: int,
         hidden_size: int,
@@ -154,6 +156,9 @@ class EPMoE(torch.nn.Module):
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
         self.tp_rank = get_tensor_model_parallel_rank()
+
+        self.num_nodes = server_args.nnodes
+        self.num_gpus = self.tp_size
 
         self.num_experts = num_experts
         assert self.num_experts % self.tp_size == 0
@@ -204,6 +209,8 @@ class EPMoE(torch.nn.Module):
 
         self.grouped_gemm_runner = None
 
+        self.iteration_count = 0
+
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
@@ -213,9 +220,16 @@ class EPMoE(torch.nn.Module):
                 use_flashinfer=False,  # TODO: use flashinfer
             )
 
+        # get batch_size, num_layers, hidden_dim size
+        batch_size, num_layers, hidden_dim = hidden_states.shape
+        # assert num_layers == self.num_layers, "The number of input layers does not match the number of model layers"
+
+        # Collect token distribution statistics
+        # First select the highest scoring groups, and within each group,
+        # select the topk with the highest score
         topk_weights, topk_ids = select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
+            hidden_states=hidden_states.view(-1, hidden_dim),
+            router_logits=router_logits.view(-1, router_logits.shape[-1]),
             top_k=self.top_k,
             use_grouped_topk=self.use_grouped_topk,
             renormalize=self.renormalize,
@@ -225,6 +239,15 @@ class EPMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
         )
 
+        # todo：在做eplb的时候确定是用部分专家还是全部专家，从而来确定select_experts中传入的top_k和topk_group的数值是否修改
+
+        print("topk_weights.shape:", topk_weights.shape)
+        print("topk_ids.shape:", topk_ids.shape)
+        # todo: if topk_ids and topk_weights shape: [batch_size*num_layers, top_k]
+        num_total = topk_ids.shape[0]  # batch_size * num_layers
+        print("num_total:", num_total)
+
+        # 对原始专家选择结果进行处理
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids, self.num_experts
         )
