@@ -30,6 +30,7 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    ReplicatedLinear
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -46,6 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.utils import add_prefix, make_layers
+from parse import parse
 
 Qwen2Config = None
 
@@ -91,6 +93,7 @@ class Qwen2MLP(nn.Module):
 class Qwen2Attention(nn.Module):
     def __init__(
         self,
+        config: Qwen2Config,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -102,6 +105,7 @@ class Qwen2Attention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -124,15 +128,81 @@ class Qwen2Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
+        if self.config.q_lora_rank is not None and layer_id in self.config.layers_with_lr_decomposition["q_proj"]:
+            self.q_proj_L = ReplicatedLinear(
+                self.config.q_lora_rank,
+                self.hidden_size,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("q_proj_L", prefix),
+            )
+
+            self.q_proj_R = ReplicatedLinear(
+                self.hidden_size,
+                self.config.q_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("q_proj_R", prefix),
+            )
+        else:
+            self.q_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.hidden_size,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("q_proj", prefix),
+            )
+
+        if self.config.kv_lora_rank is not None and layer_id in self.config.layers_with_lr_decomposition["k_proj"]:
+            self.k_proj_L = ReplicatedLinear(
+                self.config.kv_lora_rank,
+                self.num_kv_heads * self.head_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("k_proj_L", prefix),
+            )
+
+            self.k_proj_R = ReplicatedLinear(
+                self.hidden_size,
+                self.config.kv_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("k_proj_R", prefix),
+            )
+        else:
+            self.k_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.num_kv_heads * self.head_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("k_proj", prefix),
+            )
+
+        if self.config.kv_lora_rank is not None and layer_id in self.config.layers_with_lr_decomposition["v_proj"]:
+            self.v_proj_L = ReplicatedLinear(
+                self.config.kv_lora_rank,
+                self.num_kv_heads * self.head_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("v_proj_L", prefix),
+            )
+
+            self.v_proj_R = ReplicatedLinear(
+                self.hidden_size,
+                self.config.kv_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("v_proj_R", prefix),
+            )
+        else:
+            self.v_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.num_kv_heads * self.head_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("v_proj", prefix),
+            )
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -163,8 +233,21 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if hasattr(self, 'q_proj_L'):
+            q = self.q_proj_L(self.q_proj_R(hidden_states)[0])[0]
+        else:
+            q = self.q_proj(hidden_states)[0]
+
+        if hasattr(self, 'k_proj_L'):
+            k = self.k_proj_L(self.k_proj_R(hidden_states)[0])[0]
+        else:
+            k = self.k_proj(hidden_states)[0]
+
+        if hasattr(self, 'v_proj_L'):
+            v = self.v_proj_L(self.v_proj_R(hidden_states)[0])[0]
+        else:
+            v = self.v_proj(hidden_states)[0]
+
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
@@ -185,6 +268,7 @@ class Qwen2DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         self.self_attn = Qwen2Attention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -384,9 +468,6 @@ class Qwen2ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
@@ -416,6 +497,24 @@ class Qwen2ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                res = parse("model.layers.{:d}.self_attn.q_proj.bias", name)
+                if res:
+                    layer_id = res[0]
+                    if layer_id in self.config.layers_with_lr_decomposition["q_proj"]:
+                        name = name.replace("q_proj", "q_proj_L")
+
+                res = parse("model.layers.{:d}.self_attn.k_proj.bias", name)
+                if res:
+                    layer_id = res[0]
+                    if layer_id in self.config.layers_with_lr_decomposition["k_proj"]:
+                        name = name.replace("k_proj", "k_proj_L")
+
+                res = parse("model.layers.{:d}.self_attn.v_proj.bias", name)
+                if res:
+                    layer_id = res[0]
+                    if layer_id in self.config.layers_with_lr_decomposition["v_proj"]:
+                        name = name.replace("v_proj", "v_proj_L")
+
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
