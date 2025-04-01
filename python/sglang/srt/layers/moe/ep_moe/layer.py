@@ -247,43 +247,7 @@ class EPMoE(torch.nn.Module):
         num_total = topk_ids.shape[0]  # batch_size * num_layers
         print("num_total:", num_total)
 
-        # reshape [num_layers, batch_size, top_k]
-        topk_ids = topk_ids.view(num_layers, batch_size, self.top_k)
-        topk_weights = topk_weights.view(num_layers, batch_size, self.top_k)
-
-        # Initialize expert_load and count the cumulative weight of each expert at each level
-        expert_load = torch.zeros(num_layers, self.num_experts, device=hidden_states.device, dtype=torch.float32)
-
-        # Calculated separately for each layer
-        for layer in range(num_layers):
-            # Flatten the data of the current layer to [batch_size * top_k]
-            layer_ids = topk_ids[layer].reshape(-1)  # Expert Index
-            layer_weights = topk_weights[layer].reshape(-1)  # corresponding weight
-            # Accumulate the weight of each expert
-            expert_load[layer].index_add_(0, layer_ids, layer_weights)
-
-        self.iteration_count += 1  # update counter
-        # todo:EPLB calls every 1000 tokens generated
-        if self.iteration_count % 1000 == 0:
-            # load balance
-            phy2log, log2phy, expert_count = eplb.rebalance_experts(
-                weight=expert_load,  # `expert_load` shape’s [num_layers, num_experts]
-                num_replicas=self.num_experts_per_partition * self.tp_size,
-                num_groups=self.num_groups,
-                num_nodes=self.num_nodes,
-                num_gpus=self.num_gpus,
-            )
-
-            # Update topk_ids physics expert after mapping to load balancing
-            for i in range(self.top_k):
-                layer_indices = torch.arange(batch_size * num_layers, device=hidden_states.device) // batch_size
-                topk_ids[:, i] = log2phy[layer_indices, topk_ids[:, i]]
-            print("expert_load.shape:", expert_load.shape)
-            print("phy2log.shape:", phy2log.shape)
-
-        # todo: waiting debugging
-
-        # Process the original expert selection results
+        # 对原始专家选择结果进行处理
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids, self.num_experts
         )
