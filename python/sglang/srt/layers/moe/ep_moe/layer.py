@@ -274,6 +274,15 @@ class EPMoE(torch.nn.Module):
                 num_gpus=self.num_gpus,
             )
 
+            # Update topk_ids physics expert after mapping to load balancing
+            for i in range(self.top_k):
+                layer_indices = torch.arange(batch_size * num_layers, device=hidden_states.device) // batch_size
+                topk_ids[:, i] = log2phy[layer_indices, topk_ids[:, i]]
+            print("expert_load.shape:", expert_load.shape)
+            print("phy2log.shape:", phy2log.shape)
+
+        # todo: waiting debugging
+
         # Process the original expert selection results
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids, self.num_experts
