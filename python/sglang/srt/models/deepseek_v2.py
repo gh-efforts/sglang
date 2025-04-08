@@ -74,7 +74,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
 import time
-
+import os
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 
@@ -92,6 +92,8 @@ expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
 
+pid = os.getpid()
+print_log = pid % 8 == 0
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -141,7 +143,8 @@ class DeepseekV2MLP(nn.Module):
 
         end_time = time.time()
         elapsed_time_ms = (end_time - start_time) * 1000
-        print(f"        MLP use: {elapsed_time_ms:.3f} ms")
+        if print_log:
+            print(f"        MLP use: {elapsed_time_ms:.3f} ms")
         return x
 
 
@@ -286,14 +289,16 @@ class DeepseekV2MoE(nn.Module):
 
             end_time = time.time()
             elapsed_time_ms = (end_time - start_time) * 1000
-            print(f"        MoE use: {elapsed_time_ms:.3f} ms")
+            if print_log:
+                print(f"        MoE use: {elapsed_time_ms:.3f} ms")
             return out
         else:
             start_time = time.time()
             out = self.forward_deepep(hidden_states, forward_mode)
             end_time = time.time()
             elapsed_time_ms = (end_time - start_time) * 1000
-            print(f"        deepep_moe use: {elapsed_time_ms:.3f} ms")
+            if print_log:
+                print(f"        deepep_moe use: {elapsed_time_ms:.3f} ms")
             return out
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -564,7 +569,8 @@ class DeepseekV2Attention(nn.Module):
 
         end_time = time.time()
         elapsed_time_ms = (end_time - start_time) * 1000
-        print(f"        Attention use: {elapsed_time_ms:.3f} ms")
+        if print_log:
+            print(f"        Attention use: {elapsed_time_ms:.3f} ms")
         return output
 
 
@@ -758,7 +764,8 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             end_time = time.time()
             elapsed_time_ms = (end_time - start_time) * 1000
-            print(f"        AttentionMLA use: {elapsed_time_ms:.3f} ms")
+            if print_log:
+                print(f"        AttentionMLA use: {elapsed_time_ms:.3f} ms")
             return out
         else:
             if _is_hip:
@@ -772,21 +779,24 @@ class DeepseekV2AttentionMLA(nn.Module):
 
                     end_time = time.time()
                     elapsed_time_ms = (end_time - start_time) * 1000
-                    print(f"        AttentionMLA use: {elapsed_time_ms:.3f} ms")
+                    if print_log:
+                        print(f"        AttentionMLA use: {elapsed_time_ms:.3f} ms")
                     return out
                 else:
                     out = self.forward_absorb(positions, hidden_states, forward_batch)
 
                     end_time = time.time()
                     elapsed_time_ms = (end_time - start_time) * 1000
-                    print(f"        AttentionMLA use: {elapsed_time_ms:.3f} ms")
+                    if print_log:
+                        print(f"        AttentionMLA use: {elapsed_time_ms:.3f} ms")
                     return out
             else:
                 out = self.forward_absorb(positions, hidden_states, forward_batch)
 
                 end_time = time.time()
                 elapsed_time_ms = (end_time - start_time) * 1000
-                print(f"        AttentionMLA use: {elapsed_time_ms:.3f} ms")
+                if print_log:
+                    print(f"        AttentionMLA use: {elapsed_time_ms:.3f} ms")
                 return out
 
     def forward_normal(
@@ -1343,7 +1353,8 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        print("====================================================================")
+        if print_log:
+            print("====================================================================")
         global_start_time = time.time()
 
         if input_embeds is None:
@@ -1352,7 +1363,8 @@ class DeepseekV2Model(nn.Module):
             end_time = time.time()
 
             elapsed_time_ms = (end_time - start_time) * 1000
-            print(f"    embed_tokens use: {elapsed_time_ms:.3f} ms")
+            if print_log:
+                print(f"    embed_tokens use: {elapsed_time_ms:.3f} ms")
         else:
             hidden_states = input_embeds
 
@@ -1367,7 +1379,8 @@ class DeepseekV2Model(nn.Module):
 
             end_time = time.time()
             elapsed_time_ms = (end_time - start_time) * 1000
-            print(f"    layer[{i}] forward use: {elapsed_time_ms:.3f} ms")
+            if print_log:
+                print(f"    layer[{i}] forward use: {elapsed_time_ms:.3f} ms")
 
         if not forward_batch.forward_mode.is_idle():
             start_time = time.time()
@@ -1379,11 +1392,13 @@ class DeepseekV2Model(nn.Module):
 
             end_time = time.time()
             elapsed_time_ms = (end_time - start_time) * 1000
-            print(f"    norm forward use: {elapsed_time_ms:.3f} ms")
+            if print_log:
+                print(f"    norm forward use: {elapsed_time_ms:.3f} ms")
 
         global_end_time = time.time()
         elapsed_time_ms = (global_end_time - global_start_time) * 1000
-        print(f"one token use: {elapsed_time_ms:.3f} ms")
+        if print_log:
+            print(f"one token use: {elapsed_time_ms:.3f} ms")
 
         return hidden_states
 
