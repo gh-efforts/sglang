@@ -73,6 +73,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
+import time
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -132,9 +133,15 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        start_time = time.time()
+
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+
+        end_time = time.time()
+        elapsed_time_ms = (end_time - start_time) * 1000
+        print(f"        MLP use: {elapsed_time_ms:.3f} ms")
         return x
 
 
@@ -273,9 +280,21 @@ class DeepseekV2MoE(nn.Module):
         self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
     ) -> torch.Tensor:
         if not global_server_args_dict["enable_deepep_moe"]:
-            return self.forward_normal(hidden_states)
+            start_time = time.time()
+
+            out = self.forward_normal(hidden_states)
+
+            end_time = time.time()
+            elapsed_time_ms = (end_time - start_time) * 1000
+            print(f"        MoE use: {elapsed_time_ms:.3f} ms")
+            return out
         else:
-            return self.forward_deepep(hidden_states, forward_mode)
+            start_time = time.time()
+            out = self.forward_deepep(hidden_states, forward_mode)
+            end_time = time.time()
+            elapsed_time_ms = (end_time - start_time) * 1000
+            print(f"        deepep_moe use: {elapsed_time_ms:.3f} ms")
+            return out
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.n_shared_experts is not None and self.n_share_experts_fusion == 0:
@@ -498,6 +517,8 @@ class DeepseekV2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        start_time = time.time()
+
         if hidden_states.shape[0] == 0:
             assert (
                 not self.o_proj.reduce_results
@@ -540,6 +561,10 @@ class DeepseekV2Attention(nn.Module):
             ..., : self.v_head_dim
         ].reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
+
+        end_time = time.time()
+        elapsed_time_ms = (end_time - start_time) * 1000
+        print(f"        Attention use: {elapsed_time_ms:.3f} ms")
         return output
 
 
@@ -720,6 +745,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        start_time = time.time()
+
         if hidden_states.shape[0] == 0:
             assert (
                 not self.o_proj.reduce_results
@@ -727,20 +754,40 @@ class DeepseekV2AttentionMLA(nn.Module):
             return hidden_states
 
         if self.no_absorb(forward_batch):
-            return self.forward_normal(positions, hidden_states, forward_batch)
+            out = self.forward_normal(positions, hidden_states, forward_batch)
+
+            end_time = time.time()
+            elapsed_time_ms = (end_time - start_time) * 1000
+            print(f"        AttentionMLA use: {elapsed_time_ms:.3f} ms")
+            return out
         else:
             if _is_hip:
                 if (
                     self.rocm_fused_decode_mla
                     and forward_batch.forward_mode.is_decode()
                 ):
-                    return self.forward_absorb_fused_mla_rope(
+                    out =  self.forward_absorb_fused_mla_rope(
                         positions, hidden_states, forward_batch
                     )
+
+                    end_time = time.time()
+                    elapsed_time_ms = (end_time - start_time) * 1000
+                    print(f"        AttentionMLA use: {elapsed_time_ms:.3f} ms")
+                    return out
                 else:
-                    return self.forward_absorb(positions, hidden_states, forward_batch)
+                    out = self.forward_absorb(positions, hidden_states, forward_batch)
+
+                    end_time = time.time()
+                    elapsed_time_ms = (end_time - start_time) * 1000
+                    print(f"        AttentionMLA use: {elapsed_time_ms:.3f} ms")
+                    return out
             else:
-                return self.forward_absorb(positions, hidden_states, forward_batch)
+                out = self.forward_absorb(positions, hidden_states, forward_batch)
+
+                end_time = time.time()
+                elapsed_time_ms = (end_time - start_time) * 1000
+                print(f"        AttentionMLA use: {elapsed_time_ms:.3f} ms")
+                return out
 
     def forward_normal(
         self,
@@ -1296,24 +1343,48 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        print("====================================================================")
+        global_start_time = time.time()
 
         if input_embeds is None:
+            start_time = time.time()
             hidden_states = self.embed_tokens(input_ids)
+            end_time = time.time()
+
+            elapsed_time_ms = (end_time - start_time) * 1000
+            print(f"    embed_tokens use: {elapsed_time_ms:.3f} ms")
         else:
             hidden_states = input_embeds
 
         residual = None
         for i in range(len(self.layers)):
+            start_time = time.time()
             expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
+
+            end_time = time.time()
+            elapsed_time_ms = (end_time - start_time) * 1000
+            print(f"    layer[{i}] forward use: {elapsed_time_ms:.3f} ms")
+
         if not forward_batch.forward_mode.is_idle():
+            start_time = time.time()
+
             if residual is None:
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+
+            end_time = time.time()
+            elapsed_time_ms = (end_time - start_time) * 1000
+            print(f"    norm forward use: {elapsed_time_ms:.3f} ms")
+
+        global_end_time = time.time()
+        elapsed_time_ms = (global_end_time - global_start_time) * 1000
+        print(f"one token use: {elapsed_time_ms:.3f} ms")
+
         return hidden_states
 
 
