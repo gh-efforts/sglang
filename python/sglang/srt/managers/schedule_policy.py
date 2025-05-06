@@ -122,6 +122,21 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
+        # **加入会话轮询**：让不同 session 的请求交替出现
+        if waiting_queue:
+            session_groups = {}
+            for req in waiting_queue:
+                session_groups.setdefault(req.session_id, []).append(req)
+            merged = []
+            while any(session_groups.values()):
+                for sid in list(session_groups.keys()):
+                    group = session_groups.get(sid, [])
+                    if group:
+                        merged.append(group.pop(0))
+                    if not group:
+                        session_groups.pop(sid, None)
+            waiting_queue[:] = merged
+
         return prefix_computed
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:

@@ -1314,6 +1314,20 @@ class Scheduler(
         new_batch = self.get_new_batch_prefill()
         if new_batch is not None:
             # Run prefill first if possible
+            # 混合解码任务：若批次未满，加入等待的解码请求
+            for req in list(self.waiting_queue):
+                if new_batch.batch_is_full:
+                    break
+                # req.is_decode_ready() 表示该请求已经完成前缀，可以解码
+                if req.is_decode_ready() and req not in new_batch.reqs:
+                    new_batch.reqs.append(req)
+                    if new_batch.decoding_reqs is None:
+                        new_batch.decoding_reqs = []
+                    new_batch.decoding_reqs.append(req)
+                    # 更新批次满标志（按请求数或令牌数）
+                    if len(new_batch.reqs) >= self.max_running_requests:
+                        new_batch.batch_is_full = True
+                        break
             ret = new_batch
         else:
             # Run decode
@@ -1364,10 +1378,13 @@ class Scheduler(
         # Get priority queue
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
+        # 实现会话轮换：每个会话每轮最多一个请求
+        session_run_counts = defaultdict(int)
+        max_per_session = 1
         # Prefill policy
         adder = PrefillAdder(
             self.tree_cache,
-            self.token_to_kv_pool_allocator,
+            self.token_to_kv_pool_allocator+ self.tree_cache.evictable_size(),
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
@@ -1384,6 +1401,10 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            sid = req.session_id
+            # 会话公平性：同一会话每轮仅一个请求
+            if session_run_counts[sid] >= max_per_session:
+                continue
             if (
                 self.lora_paths
                 and len(
@@ -1413,6 +1434,7 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
+                        session_run_counts[sid] += 1
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
                         ) > 0 or (not self.running_batch.is_empty())

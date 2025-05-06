@@ -69,6 +69,14 @@ def fused_softcap(x, softcap_const, autotune=False):
         )
     return output
 
+@triton.jit
+def softcap_kernel(inp_ptr, out_ptr, n_elements, softcap_const: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_elements
+    x = tl.load(inp_ptr + offs, mask=mask)
+    y = tl.tanh(x / softcap_const) * softcap_const
+    tl.store(out_ptr + offs, y, mask=mask)
 
 # cast to float + softcap
 class Softcap:
@@ -79,16 +87,20 @@ class Softcap:
         return self.forward(*args, **kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.is_cuda:
-            return self.forward_cuda(x)
-        else:
-            return self.forward_native(x)
+        out = torch.empty_like(x)
+        BLOCK = 1024
+        n = x.numel()
+        grid = lambda args: ((n + BLOCK - 1) // BLOCK,)
+        softcap_kernel[grid](x, out, n, self.softcap_const, BLOCK=BLOCK)
+        return out
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         return torch.tanh(x.float() / self.softcap_const) * self.softcap_const
 
     def forward_cuda(self, x: torch.Tensor, autotune=False) -> torch.Tensor:
         return fused_softcap(x, self.softcap_const, autotune=autotune)
+
+
 
 
 rmsnorm_autotune = triton.autotune(

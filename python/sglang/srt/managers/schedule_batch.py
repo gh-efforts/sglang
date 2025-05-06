@@ -703,6 +703,9 @@ class Req:
             f"input_ids={self.origin_input_ids}, output_ids={self.output_ids})"
         )
 
+    def is_decode_ready(self):
+        pass
+
 
 bid = 0
 
@@ -1476,8 +1479,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
+
+        # 直接使用 torch.cat 合并张量
+        if self.mrope_positions is None:
+            self.mrope_positions = other.mrope_positions
+        else:
+            self.mrope_positions = torch.cat([self.mrope_positions, other.mrope_positions], dim=1)
+        if self.mrope_position_delta is None:
+            self.mrope_position_delta = other.mrope_position_delta
+        else:
+            self.mrope_position_delta = torch.cat(
+                [self.mrope_position_delta, other.mrope_position_delta], dim=0)
         self.sampling_info.merge_batch(other.sampling_info)
 
+        for req in other.reqs:
+            if req not in self.reqs:
+                self.reqs.append(req)
+        if other.decoding_reqs:
+            if self.decoding_reqs is None:
+                self.decoding_reqs = []
+            self.decoding_reqs.extend(other.decoding_reqs)
+            # 合并长度与满标志
+        self.seq_lens_sum += other.seq_lens_sum
+        self.batch_is_full = self.batch_is_full or other.batch_is_full
         # Encoder-decoder infos
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])

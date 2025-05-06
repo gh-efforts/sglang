@@ -34,6 +34,8 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+import triton
+import triton.language as tl
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,24 @@ class QuickGELU(CustomOp):
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         # TODO(zhyncs): Implement the CUDA kernel for QuickGELU in sgl-kernel
         return self.forward_native(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 调用 Triton kernel 加速
+        out = torch.empty_like(x)
+        BLOCK = 1024
+        numel = x.numel()
+        grid = lambda args: ((numel + BLOCK - 1) // BLOCK,)
+        quick_gelu_kernel[grid](x, out, numel, BLOCK=BLOCK)
+        return out
+
+@triton.jit
+def quick_gelu_kernel(inp_ptr, out_ptr, n_elements, BLOCK: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_elements
+    x = tl.load(inp_ptr + offs, mask=mask)
+    out = x * tl.sigmoid(1.702 * x)
+    tl.store(out_ptr + offs, out, mask=mask)
 
 
 class ScaledActivation(nn.Module):
