@@ -62,6 +62,7 @@ if _is_hip:
 
 logger = logging.getLogger(__name__)
 
+rank = 768
 
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
@@ -291,10 +292,10 @@ class EPMoE(torch.nn.Module):
             device=hidden_states_device,
             dtype=torch.int64,
         )
-        # GroupGemm-0
-        gateup_output = self.grouped_gemm_runner(
+
+        w1bx = self.grouped_gemm_runner(
             a=gateup_input,
-            b=self.w13_weight,
+            b=self.w1b_weight,
             c=None,
             c_dtype=hidden_states_dtype,
             batch_size=self.num_experts_per_partition,
@@ -304,13 +305,89 @@ class EPMoE(torch.nn.Module):
             use_fp8_w8a8=self.use_fp8_w8a8,
             scale_a=self.w13_input_scale,
             scale_b=(
-                self.w13_weight_scale_inv
+                self.w1b_weight_scale_inv
                 if self.use_block_quant
-                else self.w13_weight_scale
+                else self.w1b_weight_scale
             ),
             block_shape=self.block_shape,
         )
-        del gateup_input
+
+        if self.activation_scheme == "dynamic" and not self.use_block_quant:
+            max_value = (
+                torch.max(w1bx)
+                .repeat(self.num_experts_per_partition)
+                .to(torch.float32)
+            )
+            self.w1a_input_scale = max_value / torch.finfo(self.fp8_dtype).max
+
+        w1x = self.grouped_gemm_runner(
+            a=w1bx,
+            b=self.w1a_weight,
+            c=None,
+            c_dtype=hidden_states_dtype,
+            batch_size=self.num_experts_per_partition,
+            weight_column_major=True,
+            seg_indptr=seg_indptr_cur_rank,
+            weight_indices=weight_indices_cur_rank,
+            use_fp8_w8a8=self.use_fp8_w8a8,
+            scale_a=self.w1a_input_scale,
+            scale_b=(
+                self.w1a_weight_scale_inv
+                if self.use_block_quant
+                else self.w1a_weight_scale
+            ),
+            block_shape=self.block_shape,
+        )
+        del w1bx
+
+        w3bx = self.grouped_gemm_runner(
+            a=gateup_input,
+            b=self.w3b_weight,
+            c=None,
+            c_dtype=hidden_states_dtype,
+            batch_size=self.num_experts_per_partition,
+            weight_column_major=True,
+            seg_indptr=seg_indptr_cur_rank,
+            weight_indices=weight_indices_cur_rank,
+            use_fp8_w8a8=self.use_fp8_w8a8,
+            scale_a=self.w13_input_scale,
+            scale_b=(
+                self.w3b_weight_scale_inv
+                if self.use_block_quant
+                else self.w3b_weight_scale
+            ),
+            block_shape=self.block_shape,
+        )
+
+        if self.activation_scheme == "dynamic" and not self.use_block_quant:
+            max_value = (
+                torch.max(w3bx)
+                .repeat(self.num_experts_per_partition)
+                .to(torch.float32)
+            )
+            self.w3a_input_scale = max_value / torch.finfo(self.fp8_dtype).max
+
+        w3x = self.grouped_gemm_runner(
+            a=w3bx,
+            b=self.w3a_weight,
+            c=None,
+            c_dtype=hidden_states_dtype,
+            batch_size=self.num_experts_per_partition,
+            weight_column_major=True,
+            seg_indptr=seg_indptr_cur_rank,
+            weight_indices=weight_indices_cur_rank,
+            use_fp8_w8a8=self.use_fp8_w8a8,
+            scale_a=self.w3a_input_scale,
+            scale_b=(
+                self.w3a_weight_scale_inv
+                if self.use_block_quant
+                else self.w3a_weight_scale
+            ),
+            block_shape=self.block_shape,
+        )
+        del w3bx
+
+        gateup_output = torch.cat([w1x, w3x], dim=1)
 
         # Act
         down_input = torch.empty(
@@ -323,8 +400,8 @@ class EPMoE(torch.nn.Module):
                 else hidden_states_dtype
             ),
         )
-        if self.w2_input_scale is None and not self.use_block_quant:
-            self.w2_input_scale = torch.ones(
+        if self.w2b_input_scale is None and not self.use_block_quant:
+            self.w2b_input_scale = torch.ones(
                 self.num_experts_per_partition,
                 dtype=torch.float32,
                 device=hidden_states_device,
@@ -336,7 +413,7 @@ class EPMoE(torch.nn.Module):
                 down_input,
                 gateup_output.shape[1],
                 reorder_topk_ids,
-                self.w2_input_scale,
+                self.w2b_input_scale,
                 self.start_expert_id,
                 self.end_expert_id,
                 BLOCK_SIZE=512,
@@ -347,7 +424,7 @@ class EPMoE(torch.nn.Module):
                 down_input,
                 gateup_output.shape[1],
                 reorder_topk_ids,
-                self.w2_input_scale,
+                self.w2b_input_scale,
                 self.start_expert_id,
                 self.end_expert_id,
                 BLOCK_SIZE=512,
@@ -356,31 +433,65 @@ class EPMoE(torch.nn.Module):
             raise ValueError(f"Unsupported activation: {self.activation=}")
         del gateup_output
 
-        # GroupGemm-1
-        down_output = torch.empty(
+        w2bx = torch.empty(
             down_input.shape[0],
-            self.w2_weight.shape[1],
+            self.w2b_weight.shape[1],
             device=hidden_states_device,
             dtype=hidden_states_dtype,
         )
-        down_output = self.grouped_gemm_runner(
+
+        w2bx = self.grouped_gemm_runner(
             a=down_input,
-            b=self.w2_weight,
+            b=self.w2b_weight,
+            c=w2bx,
+            batch_size=self.num_experts_per_partition,
+            weight_column_major=True,
+            seg_indptr=seg_indptr_cur_rank,
+            weight_indices=weight_indices_cur_rank,
+            use_fp8_w8a8=self.use_fp8_w8a8,
+            scale_a=self.w2b_input_scale,
+            scale_b=(
+                self.w2b_weight_scale_inv
+                if self.use_block_quant
+                else self.w2b_weight_scale
+            ),
+            block_shape=self.block_shape,
+        )
+        del down_input
+
+        if self.activation_scheme == "dynamic" and not self.use_block_quant:
+            max_value = (
+                torch.max(w2bx)
+                .repeat(self.num_experts_per_partition)
+                .to(torch.float32)
+            )
+            self.w2a_input_scale = max_value / torch.finfo(self.fp8_dtype).max
+
+        down_output = torch.empty(
+            w2bx.shape[0],
+            self.w2a_weight.shape[1],
+            device=hidden_states_device,
+            dtype=hidden_states_dtype,
+        )
+
+        down_output = self.grouped_gemm_runner(
+            a=w2bx,
+            b=self.w2a_weight,
             c=down_output,
             batch_size=self.num_experts_per_partition,
             weight_column_major=True,
             seg_indptr=seg_indptr_cur_rank,
             weight_indices=weight_indices_cur_rank,
             use_fp8_w8a8=self.use_fp8_w8a8,
-            scale_a=self.w2_input_scale,
+            scale_a=self.w2a_input_scale,
             scale_b=(
-                self.w2_weight_scale_inv
+                self.w2a_weight_scale_inv
                 if self.use_block_quant
-                else self.w2_weight_scale
+                else self.w2a_weight_scale
             ),
             block_shape=self.block_shape,
         )
-        del down_input
+        del w2bx
 
         # PostReorder
         output = torch.empty(
@@ -414,22 +525,20 @@ class EPMoE(torch.nn.Module):
         num_experts: int,
     ) -> List[Tuple[str, str, int, str]]:
         return [
-            # (param_name, weight_name, expert_id, shard_id)
             (
-                (
-                    "experts.w13_"
-                    if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
-                    else "experts.w2_"
-                ),
-                f"experts.{expert_id}.{weight_name}.",
+                f"experts.{shard_id}_",  # param name prefix
+                f"experts.{expert_id}.{weight_name}_low{suffix}.",  # checkpoint weight name
                 expert_id,
                 shard_id,
             )
             for expert_id in range(num_experts)
-            for shard_id, weight_name in [
-                ("w1", ckpt_gate_proj_name),
-                ("w2", ckpt_down_proj_name),
-                ("w3", ckpt_up_proj_name),
+            for shard_id, weight_name, suffix in [
+                ("w1a", ckpt_gate_proj_name, "a"),
+                ("w1b", ckpt_gate_proj_name, "b"),
+                ("w2a", ckpt_down_proj_name, "a"),
+                ("w2b", ckpt_down_proj_name, "b"),
+                ("w3a", ckpt_up_proj_name, "a"),
+                ("w3b", ckpt_up_proj_name, "b"),
             ]
         ]
 
@@ -467,11 +576,6 @@ class EPMoE(torch.nn.Module):
             return
         expert_id = expert_id - self.start_expert_id
 
-        if shard_id not in ("w1", "w2", "w3"):
-            raise ValueError(
-                f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
-            )
-
         # Special case for fp8 scales.
         if "scale" in weight_name:
             self._load_fp8_scale(
@@ -483,14 +587,7 @@ class EPMoE(torch.nn.Module):
             )
             return
 
-        if shard_id == "w2":
-            param.data[expert_id] = loaded_weight
-        elif shard_id == "w1":
-            param.data[expert_id][: self.intermediate_size, :] = loaded_weight
-        elif shard_id == "w3":
-            param.data[expert_id][self.intermediate_size :, :] = loaded_weight
-        else:
-            raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
+        param.data[expert_id] = loaded_weight
 
     def _load_fp8_scale(
         self,
@@ -501,45 +598,7 @@ class EPMoE(torch.nn.Module):
         expert_id: int,
     ) -> None:
         param_data = param.data
-
-        # Input scales can be loaded directly and should be equal.
-        if "input_scale" in weight_name:
-            if (
-                (shard_id == "w1" or shard_id == "w3")
-                and param_data[expert_id] != 1
-                and (param_data[expert_id] - loaded_weight).abs() > 1e-5
-            ):
-                raise ValueError(
-                    "input_scales of w1 and w3 of a layer "
-                    f"must be equal. But got {param_data[expert_id]} "
-                    f"vs. {loaded_weight}"
-                )
-            param_data[expert_id] = loaded_weight
-        # Weight scales
-        elif "weight_scale" in weight_name:
-            if self.use_block_quant:
-                block_n, block_k = self.block_shape[0], self.block_shape[1]
-                if shard_id == "w1":
-                    param_data[expert_id][
-                        : (self.intermediate_size + block_n - 1) // block_n, :
-                    ] = loaded_weight
-                elif shard_id == "w3":
-                    param_data[expert_id][
-                        (self.intermediate_size + block_n - 1) // block_n :, :
-                    ] = loaded_weight
-                else:  # w2
-                    param_data[expert_id] = loaded_weight
-            # If we are in merged column case (gate_up_proj)
-            else:
-                if shard_id in ("w1", "w3"):
-                    # We have to keep the weight scales of w1 and w3 because
-                    # we need to re-quantize w1/w3 weights after weight loading.
-                    idx = 0 if shard_id == "w1" else 1
-                    param_data[expert_id][idx] = loaded_weight
-
-                # If we are in the row parallel case (down_proj)
-                else:
-                    param_data[expert_id] = loaded_weight
+        param_data[expert_id] = loaded_weight
 
 
 class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
@@ -554,50 +613,120 @@ class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
         **extra_weight_attrs,
     ):
         # Fused gate_up_proj (column parallel)
-        w13_weight = torch.nn.Parameter(
+        w1a_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts_per_partition,
-                2 * intermediate_size,
+                intermediate_size,
+                rank,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w1a_weight", w1a_weight)
+        set_weight_attrs(w1a_weight, extra_weight_attrs)
+
+        w1b_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition,
+                rank,
                 hidden_size,
                 dtype=params_dtype,
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
+        layer.register_parameter("w1b_weight", w1b_weight)
+        set_weight_attrs(w1b_weight, extra_weight_attrs)
+
+        w3a_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition,
+                intermediate_size,
+                rank,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w3a_weight", w3a_weight)
+        set_weight_attrs(w3a_weight, extra_weight_attrs)
+
+        w3b_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition,
+                rank,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w3b_weight", w3b_weight)
+        set_weight_attrs(w3b_weight, extra_weight_attrs)
 
         # down_proj (row parallel)
-        w2_weight = torch.nn.Parameter(
+        w2a_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts_per_partition,
                 hidden_size,
+                rank,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2a_weight", w2a_weight)
+        set_weight_attrs(w2a_weight, extra_weight_attrs)
+
+        w2b_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition,
+                rank,
                 intermediate_size,
                 dtype=params_dtype,
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
+        layer.register_parameter("w2b_weight", w2b_weight)
+        set_weight_attrs(w2b_weight, extra_weight_attrs)
 
         # scale
         layer.register_parameter("w13_input_scale", None)
-        layer.register_parameter("w13_weight_scale", None)
+        layer.register_parameter("w1a_input_scale", None)
+        layer.register_parameter("w3a_input_scale", None)
+
+        layer.register_parameter("w1a_weight_scale", None)
+        layer.register_parameter("w1b_weight_scale", None)
+
+        layer.register_parameter("w3a_weight_scale", None)
+        layer.register_parameter("w3b_weight_scale", None)
+
 
         ones_tensor = torch.ones(num_experts_per_partition, dtype=torch.float32)
 
-        w2_input_scale = torch.nn.Parameter(
+        w2a_input_scale = torch.nn.Parameter(
             ones_tensor,
             requires_grad=False,
         )
-        layer.register_parameter("w2_input_scale", w2_input_scale)
-        set_weight_attrs(w2_input_scale, extra_weight_attrs)
+        layer.register_parameter("w2a_input_scale", w2a_input_scale)
+        set_weight_attrs(w2a_input_scale, extra_weight_attrs)
 
-        w2_weight_scale = torch.nn.Parameter(
+        w2b_input_scale = torch.nn.Parameter(
             ones_tensor,
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        layer.register_parameter("w2b_input_scale", w2b_input_scale)
+        set_weight_attrs(w2b_input_scale, extra_weight_attrs)
+
+        w2a_weight_scale = torch.nn.Parameter(
+            ones_tensor,
+            requires_grad=False,
+        )
+        layer.register_parameter("w2a_weight_scale", w2a_weight_scale)
+        set_weight_attrs(w2a_weight_scale, extra_weight_attrs)
+
+        w2b_weight_scale = torch.nn.Parameter(
+            ones_tensor,
+            requires_grad=False,
+        )
+        layer.register_parameter("w2b_weight_scale", w2b_weight_scale)
+        set_weight_attrs(w2b_weight_scale, extra_weight_attrs)
 
     def apply(
         self,
