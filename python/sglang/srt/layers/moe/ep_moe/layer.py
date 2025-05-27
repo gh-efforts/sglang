@@ -53,6 +53,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs
+import time
 
 _is_hip = is_hip()
 
@@ -217,6 +218,8 @@ class EPMoE(torch.nn.Module):
         self.grouped_gemm_runner = None
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        start_time = time.time()
+
         hidden_states_shape = hidden_states.shape
         hidden_states_dtype = hidden_states.dtype
         hidden_states_device = hidden_states.device
@@ -395,6 +398,11 @@ class EPMoE(torch.nn.Module):
             hidden_states_shape[1],
             BLOCK_SIZE=512,
         )
+
+        end_time = time.time()
+        elapsed_time_ms = (end_time - start_time) * 1000
+        print(f"EPMoE forward use: {elapsed_time_ms:.3f} ms")
+
         return output
 
     @classmethod
