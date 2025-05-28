@@ -640,6 +640,84 @@ def compute_m_num_tiles_indptr(
         tl.store(m_num_tiles_indptr + bs + 1, pre_num_tiles + cur_num_tiles)
 
 
+def grouped_gemm_triton_no_dispose(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    batch_size: int,
+    weight_column_major: bool,
+    seg_indptr: Optional[torch.Tensor] = None,
+    weight_indices: Optional[torch.Tensor] = None,
+    use_fp8_w8a8: bool = False,
+    scale_a: torch.Tensor = None,
+    scale_b: torch.Tensor = None,
+    block_shape: Optional[List[int]] = None,
+    c_dtype=None,
+):
+    assert weight_column_major == True  # TODO: more
+    if use_fp8_w8a8 and block_shape is None:
+        assert scale_a is not None and scale_b is not None
+
+    if block_shape is not None:
+        a_original = a
+
+        assert len(block_shape) == 2
+        block_n, block_k = block_shape[0], block_shape[1]
+        a, scale_a = per_token_group_quant_fp8(a, block_k)
+
+        assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
+        assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
+        assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
+
+    # TODO: adjust config or tune kernel
+    # Reduce block size to prevent L40 shared memory overflow.
+    config = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 128,
+    }
+
+    m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
+    compute_m_num_tiles_indptr[(1,)](
+        m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
+    )
+
+    if c is None:
+        assert c_dtype is not None
+        c = torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=c_dtype)
+
+    grid = lambda META: (
+        triton.cdiv(a.size(0), META["BLOCK_SIZE_M"]) + batch_size,
+        triton.cdiv(b.size(1), META["BLOCK_SIZE_N"]),
+    )
+
+    grouped_gemm_triton_kernel[grid](
+        a,
+        b,
+        c,
+        batch_size,
+        b.size(1),
+        b.size(2),
+        seg_indptr,
+        weight_indices,
+        m_num_tiles_indptr,
+        scale_a,
+        scale_b,
+        use_fp8_w8a8,
+        0 if block_shape is None else block_shape[0],
+        0 if block_shape is None else block_shape[1],
+        a.stride(0),
+        b.stride(0),
+        b.stride(1),
+        scale_a.stride(0) if scale_a is not None and scale_a.ndim == 2 else 0,
+        scale_a.stride(1) if scale_a is not None and scale_a.ndim == 2 else 0,
+        scale_b.stride(0) if scale_b is not None and scale_b.ndim >= 2 else 0,
+        scale_b.stride(2) if scale_b is not None and scale_b.ndim == 3 else 0,
+        scale_b.stride(1) if scale_b is not None and scale_b.ndim >= 2 else 0,
+        **config,
+    )
+    return c
+
 def grouped_gemm_triton(
     a: torch.Tensor,
     b: torch.Tensor,
