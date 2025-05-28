@@ -54,6 +54,7 @@ from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs
 import time
+import os
 
 _is_hip = is_hip()
 
@@ -62,7 +63,8 @@ if _is_hip:
 
 logger = logging.getLogger(__name__)
 
-rank = 768
+rank = int(os.environ.get("DEEPSEEK_RANK"))
+scale_rank = int(os.environ.get("DEEPSEEK_SCALE_RANK"))
 
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
@@ -793,67 +795,188 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                     )
 
         # WEIGHTS
-        w13_weight = torch.nn.Parameter(
+        w1a_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts_per_partition,
-                2 * intermediate_size,
+                intermediate_size,
+                rank,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w1a_weight", w1a_weight)
+        set_weight_attrs(w1a_weight, extra_weight_attrs)
+
+        w1b_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition,
+                rank,
                 hidden_size,
                 dtype=params_dtype,
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
+        layer.register_parameter("w1b_weight", w1b_weight)
+        set_weight_attrs(w1b_weight, extra_weight_attrs)
 
-        w2_weight = torch.nn.Parameter(
+        w3a_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition,
+                intermediate_size,
+                rank,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w3a_weight", w3a_weight)
+        set_weight_attrs(w3a_weight, extra_weight_attrs)
+
+        w3b_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition,
+                rank,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w3b_weight", w3b_weight)
+        set_weight_attrs(w3b_weight, extra_weight_attrs)
+
+        w2a_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts_per_partition,
                 hidden_size,
+                rank,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2a_weight", w2a_weight)
+        set_weight_attrs(w2a_weight, extra_weight_attrs)
+
+        w2b_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition,
+                rank,
                 intermediate_size,
                 dtype=params_dtype,
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
+        layer.register_parameter("w2b_weight", w2b_weight)
+        set_weight_attrs(w2b_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
         if self.block_quant:
-            w13_weight_scale = torch.nn.Parameter(
+            w1a_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts_per_partition,
-                    2 * ((intermediate_size + block_n - 1) // block_n),
+                    (intermediate_size + block_n - 1) // block_n,
+                    scale_rank,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+
+            w1b_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts_per_partition,
+                    scale_rank,
                     (hidden_size + block_k - 1) // block_k,
                     dtype=torch.float32,
                 ),
                 requires_grad=False,
             )
-            w2_weight_scale = torch.nn.Parameter(
+
+            w3a_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts_per_partition,
+                    (intermediate_size + block_n - 1) // block_n,
+                    scale_rank,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+
+            w3b_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts_per_partition,
+                    scale_rank,
+                    (hidden_size + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+
+            layer.register_parameter("w1a_weight_scale_inv", w1a_weight_scale)
+            layer.register_parameter("w1b_weight_scale_inv", w1b_weight_scale)
+            layer.register_parameter("w3a_weight_scale_inv", w3a_weight_scale)
+            layer.register_parameter("w3b_weight_scale_inv", w3b_weight_scale)
+
+            w2a_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts_per_partition,
                     (hidden_size + block_n - 1) // block_n,
+                    scale_rank,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+
+            w2b_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts_per_partition,
+                    scale_rank,
                     (intermediate_size + block_k - 1) // block_k,
                     dtype=torch.float32,
                 ),
                 requires_grad=False,
             )
-            layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
-            layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+
+            layer.register_parameter("w2a_weight_scale_inv", w2a_weight_scale)
+            layer.register_parameter("w2b_weight_scale_inv", w2b_weight_scale)
+
             assert self.quant_config.activation_scheme == "dynamic"
         else:
             # WEIGHT_SCALES
-            # Allocate 2 scales for w1 and w3 respectively.
-            w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts_per_partition, 2, dtype=torch.float32),
-                requires_grad=False,
-            )
-            layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-            w2_weight_scale = torch.nn.Parameter(
+            w1a_weight_scale = torch.nn.Parameter(
                 torch.ones(num_experts_per_partition, dtype=torch.float32),
                 requires_grad=False,
             )
-            layer.register_parameter("w2_weight_scale", w2_weight_scale)
+            layer.register_parameter("w1a_weight_scale", w1a_weight_scale)
+
+            w1b_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w1b_weight_scale", w1b_weight_scale)
+
+            w3a_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w3a_weight_scale", w3a_weight_scale)
+
+            w3b_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w3b_weight_scale", w3b_weight_scale)
+
+            w2a_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2a_weight_scale", w2a_weight_scale)
+
+            w2b_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2b_weight_scale", w2b_weight_scale)
+
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
         extra_weight_attrs.update(
@@ -865,8 +988,14 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         # If loading an fp16 checkpoint, do not (we will quantize in
         #   process_weights_after_loading()
         if self.quant_config.is_checkpoint_fp8_serialized:
-            set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-            set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+            set_weight_attrs(w1a_weight_scale, extra_weight_attrs)
+            set_weight_attrs(w1b_weight_scale, extra_weight_attrs)
+
+            set_weight_attrs(w3a_weight_scale, extra_weight_attrs)
+            set_weight_attrs(w3b_weight_scale, extra_weight_attrs)
+
+            set_weight_attrs(w2a_weight_scale, extra_weight_attrs)
+            set_weight_attrs(w2b_weight_scale, extra_weight_attrs)
 
         # INPUT_SCALES
         if self.quant_config.activation_scheme == "static":
@@ -883,16 +1012,24 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
             layer.register_parameter("w13_input_scale", w13_input_scale)
             set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
-            w2_input_scale = torch.nn.Parameter(
+            w2a_input_scale = torch.nn.Parameter(
                 torch.ones(num_experts_per_partition, dtype=torch.float32),
                 requires_grad=False,
             )
-            layer.register_parameter("w2_input_scale", w2_input_scale)
-            set_weight_attrs(w2_input_scale, extra_weight_attrs)
+            layer.register_parameter("w2a_input_scale", w2a_input_scale)
+            set_weight_attrs(w2a_input_scale, extra_weight_attrs)
+
+            w2b_input_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2b_input_scale", w2b_input_scale)
+            set_weight_attrs(w2b_input_scale, extra_weight_attrs)
 
         else:
             layer.w13_input_scale = None
-            layer.w2_input_scale = None
+            layer.w2a_input_scale = None
+            layer.w2b_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
 
