@@ -1452,6 +1452,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 and self.config.architectures[0] == architecture
                 and self.config.n_routed_experts == 256
                 and (not global_server_args_dict["enable_deepep_moe"])
+                and False
             ):
                 self.n_share_experts_fusion = self.tp_size
                 global_server_args_dict["n_share_experts_fusion"] = self.tp_size
