@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
     gelu_and_mul_triton_kernel,
-    grouped_gemm_triton,
+    grouped_gemm_triton_no_dispose,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
     run_moe_ep_preproess,
