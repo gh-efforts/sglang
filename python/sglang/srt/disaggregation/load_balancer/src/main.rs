@@ -142,8 +142,8 @@ impl Context {
                             .map(|(cache_num, timestamp)| (*cache_num as f64, timestamp));
 
                         let cache_token = select_node.as_ref().map(|(v, _)| *v).unwrap_or(0f64);
-                        // w * num of cache token / 100
-                        let cache_score = self.score_weight.num_of_cache_token * cache_token / 100f64;
+                        // w * num of cache token
+                        let cache_score = self.score_weight.num_of_cache_token * cache_token;
 
                         if let Some((max_score, _, _, _)) = max_score_node {
                             if load_score + cache_score > max_score {
