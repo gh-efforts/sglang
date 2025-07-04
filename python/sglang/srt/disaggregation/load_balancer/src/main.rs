@@ -515,7 +515,7 @@ async fn chat_completions(
             body.insert(String::from("bootstrap_port"), bootstrap_port);
         }
         body.insert(String::from("bootstrap_room"), serde_json::Value::from(bootstrap_room));
-        body.insert(String::from("decode_rank"), serde_json::Value::from(pair.decode_rank));
+        body.insert(String::from("data_parallel_rank"), serde_json::Value::from(pair.decode_rank));
 
         let body = serde_json::to_vec(&body)?;
         let body = Bytes::from(body);
