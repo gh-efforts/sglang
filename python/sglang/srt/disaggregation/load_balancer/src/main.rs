@@ -85,8 +85,11 @@ struct PrefillConfig {
 
 #[derive(Copy, Clone, clap::Args)]
 struct ScoreWeight {
+    #[arg(long)]
     task_queue: f64,
-    num_of_cache_token: f64
+
+    #[arg(long)]
+    compute_tokens: f64
 }
 
 struct Context {
@@ -126,13 +129,13 @@ impl Context {
             let (dst, c) = {
                 let guard = self.prefill_servers.read();
                 // score, prefill config, prefill server guard, select node timestamp
-                let mut max_score_node: Option<(f64, DstProcess, &Arc<()>, Option<&Arc<AtomicI64>>)> = None;
+                let mut min_score_node: Option<(f64, DstProcess, &Arc<()>, Option<&Arc<AtomicI64>>)> = None;
 
                 for (config, dp_count) in guard.iter() {
                     for rank in 0..self.prefill_dp_size {
                         let count = &dp_count[rank];
-                        // w / (1 + task_queue)
-                        let load_score = self.score_weight.task_queue / (1f64 + Arc::strong_count(count) as f64);
+                        // w * task_queue
+                        let load_score = self.score_weight.task_queue * Arc::strong_count(count) as f64;
 
                         let dst = DstProcess {
                             node: config.clone(),
@@ -143,19 +146,19 @@ impl Context {
 
                         let cache_token = select_node.as_ref().map(|(v, _)| *v).unwrap_or(0f64);
                         // w * num of cache token
-                        let cache_score = self.score_weight.num_of_cache_token * cache_token;
+                        let cache_score = self.score_weight.compute_tokens * (encoding.get_ids().len() as f64 - cache_token);
 
-                        if let Some((max_score, _, _, _)) = max_score_node {
-                            if load_score + cache_score > max_score {
-                                max_score_node = Some((load_score + cache_score, dst, count, select_node.map(|(_, t)| t)));
+                        if let Some((min_score, _, _, _)) = min_score_node {
+                            if load_score + cache_score < min_score {
+                                min_score_node = Some((load_score + cache_score, dst, count, select_node.map(|(_, t)| t)));
                             }
                         } else {
-                            max_score_node = Some((load_score + cache_score, dst, count, select_node.map(|(_, t)| t)));
+                            min_score_node = Some((load_score + cache_score, dst, count, select_node.map(|(_, t)| t)));
                         }
                     }
                 }
 
-                let select_node= max_score_node.unwrap();
+                let select_node= min_score_node.unwrap();
 
                 if let Some(v) = select_node.3 {
                     v.store(Utc::now().timestamp(), Ordering::Relaxed);
