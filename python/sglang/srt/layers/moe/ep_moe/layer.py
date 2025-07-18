@@ -56,7 +56,8 @@ from sglang.srt.utils import (
     is_npu,
     set_weight_attrs,
 )
-
+import time
+import os
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -75,6 +76,7 @@ if _use_aiter:
 
 logger = logging.getLogger(__name__)
 
+weight_slice = os.environ.get("SGLANG_WEIGHT_SLICE")
 
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
@@ -314,10 +316,23 @@ class EPMoE(torch.nn.Module):
         return (local_num_experts, expert_map)
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        if weight_slice:
+            print("slice")
+            self.w13_weight = torch.nn.Parameter(self.w13_weight[:, :2, :].contiguous())
+            self.w2_weight = torch.nn.Parameter(self.w2_weight[:, :, :1].contiguous())
+            torch.cuda.synchronize()
+
+        start_time = time.time()
+
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
-            return self.forward_deepgemm(hidden_states, router_logits)
+            out = self.forward_deepgemm(hidden_states, router_logits)
         else:
-            return self.forward_normal(hidden_states, router_logits)
+            out =  self.forward_normal(hidden_states, router_logits)
+
+        end_time = time.time()
+        elapsed_time_ms = (end_time - start_time) * 1000
+        print(f"EPMoE forward use: {elapsed_time_ms:.3f} ms")
+        return out
 
     def forward_deepgemm(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
@@ -1318,23 +1333,36 @@ class DeepEPMoE(EPMoE):
         num_recv_tokens_per_expert: List[int],
         forward_batch: ForwardBatch,
     ):
+        if weight_slice:
+            print("slice")
+            self.w13_weight = torch.nn.Parameter(self.w13_weight[:, :2, :].contiguous())
+            self.w2_weight = torch.nn.Parameter(self.w2_weight[:, :, :1].contiguous())
+            torch.cuda.synchronize()
+
+        start_time = time.time()
+
         if _use_aiter:
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
-            return self.forward_aiter(hidden_states, topk_idx, topk_weights)
+            out = self.forward_aiter(hidden_states, topk_idx, topk_weights)
         resolved_deepep_mode = self.deepep_mode.resolve(
             forward_batch.is_extend_in_batch
         )
         if resolved_deepep_mode == DeepEPMode.normal:
             if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-                return self.forward_deepgemm_contiguous(
+                out = self.forward_deepgemm_contiguous(
                     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
                 )
             else:
-                return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
+                out = self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         elif resolved_deepep_mode == DeepEPMode.low_latency:
-            return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
+            out = self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+
+        end_time = time.time()
+        elapsed_time_ms = (end_time - start_time) * 1000
+        print(f"DeepEPMoE forward use: {elapsed_time_ms:.3f} ms")
+        return out
 
     def forward_normal(
         self,
